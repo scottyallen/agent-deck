@@ -11054,7 +11054,7 @@ func sessionHasConversationData(inst *Instance, sessionID string) bool {
 			// File doesn't exist anywhere - use --session-id to create fresh session
 			// (there's nothing to resume if the file doesn't exist)
 			sessionLog.Warn("session_data_file_not_found",
-				slog.String("session_id", sessionID),
+				slog.String("session_id", logging.SanitizeValue(sessionID)),
 				slog.String("expected_path", logging.SanitizeValue(sessionFile)),
 				slog.String("result", "use_session_id_fresh_conversation"))
 			emitDecision(false, "file_not_found")
@@ -11180,14 +11180,14 @@ func importConversationFromOtherConfigDir(inst *Instance, sessionID, configDir s
 	dst, written, err := MigrateConversationFromSized(inst, srcDir, configDir)
 	if err != nil || dst == "" {
 		sessionLog.Warn("session_data_import_failed",
-			slog.String("session_id", sessionID),
+			slog.String("session_id", logging.SanitizeValue(sessionID)),
 			slog.String("source_config_dir", logging.SanitizeValue(srcDir)),
 			slog.String("target_config_dir", logging.SanitizeValue(configDir)),
-			slog.String("error", fmt.Sprintf("%v", err)))
+			slog.String("error", logging.SanitizeValue(fmt.Sprintf("%v", err))))
 		return ""
 	}
 	sessionLog.Info("session_data_imported_from_other_config_dir",
-		slog.String("session_id", sessionID),
+		slog.String("session_id", logging.SanitizeValue(sessionID)),
 		slog.String("source_config_dir", logging.SanitizeValue(srcDir)),
 		slog.String("target_config_dir", logging.SanitizeValue(configDir)),
 		slog.Int64("source_bytes", srcSize),
