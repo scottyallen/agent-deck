@@ -11040,9 +11040,23 @@ func sessionHasConversationData(inst *Instance, sessionID string) bool {
 			emitDecision(false, "foreign_project_dir_resume_would_fail")
 			return false
 		case fallbackPath == "":
+			// #2269: not in this config dir at all. The transcript may live in
+			// another known config dir (the session was created under a
+			// different account, or under ~/.claude before the account was
+			// pinned). Copy it in so the new process finds it where it looks,
+			// then resume - otherwise `--session-id <id>` fabricates an empty
+			// conversation under a real id and poisons later resumes.
+			if importedPath := importConversationFromOtherConfigDir(inst, sessionID, configDir); importedPath != "" {
+				fallbackPathFound = importedPath
+				sessionFile = importedPath
+				break
+			}
 			// File doesn't exist anywhere - use --session-id to create fresh session
 			// (there's nothing to resume if the file doesn't exist)
-			sessionLog.Debug("session_data_file_not_found", slog.String("result", "use_session_id"))
+			sessionLog.Warn("session_data_file_not_found",
+				slog.String("session_id", sessionID),
+				slog.String("expected_path", logging.SanitizeValue(sessionFile)),
+				slog.String("result", "use_session_id_fresh_conversation"))
 			emitDecision(false, "file_not_found")
 			return false
 		default:
@@ -11141,6 +11155,46 @@ func encodesSameWorkingDir(encodedDir, projectPath, resolvedPath string) bool {
 // Uses the PER-INSTANCE config dir (via GetClaudeConfigDirForInstance) when
 // inst is non-nil so sessions with conductor/group config_dir overrides find
 // their own JSONLs. Passing inst == nil degrades to the global lookup.
+// importConversationFromOtherConfigDir handles the #2269 case: the resolved
+// config dir for a restart has no transcript for sessionID, but another known
+// config dir (~/.claude or any profile's config_dir) does. It copies the
+// transcript into configDir, stripping stale history-suppression records on
+// the way (see suppressedConversationRecordTypes), and returns the imported
+// path, or "" when no other dir holds it or the copy failed.
+func importConversationFromOtherConfigDir(inst *Instance, sessionID, configDir string) string {
+	if inst == nil || sessionID == "" || configDir == "" {
+		return ""
+	}
+	// LocateConversationConfigDir keys on inst.ClaudeSessionID and, with an
+	// empty id, falls back to the newest conversation for the project - which
+	// could be a sibling session's. Only scan when the id we were asked to
+	// resume is the instance's own bound id.
+	if strings.TrimSpace(inst.ClaudeSessionID) != sessionID {
+		return ""
+	}
+	cfg, _ := LoadUserConfig()
+	srcDir, _, srcSize := LocateConversationConfigDir(cfg, inst, configDir)
+	if srcDir == "" || filepath.Clean(srcDir) == filepath.Clean(configDir) || resolveRealPath(srcDir) == resolveRealPath(configDir) {
+		return ""
+	}
+	dst, written, err := MigrateConversationFromSized(inst, srcDir, configDir)
+	if err != nil || dst == "" {
+		sessionLog.Warn("session_data_import_failed",
+			slog.String("session_id", sessionID),
+			slog.String("source_config_dir", logging.SanitizeValue(srcDir)),
+			slog.String("target_config_dir", logging.SanitizeValue(configDir)),
+			slog.String("error", fmt.Sprintf("%v", err)))
+		return ""
+	}
+	sessionLog.Info("session_data_imported_from_other_config_dir",
+		slog.String("session_id", sessionID),
+		slog.String("source_config_dir", logging.SanitizeValue(srcDir)),
+		slog.String("target_config_dir", logging.SanitizeValue(configDir)),
+		slog.Int64("source_bytes", srcSize),
+		slog.Int64("written_bytes", written))
+	return dst
+}
+
 func findSessionFileInAllProjects(inst *Instance, sessionID string) string {
 	if sessionID == "" {
 		return ""
