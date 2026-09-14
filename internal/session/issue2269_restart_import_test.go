@@ -9,10 +9,10 @@ import (
 
 // Issue #2269: `session restart` fell back to `--session-id <id>` (a blank
 // conversation under a real id) when the transcript lived in another config
-// dir. sessionHasConversationData must locate it in ~/.claude (or any
-// profile's config_dir), copy it into the dir the new process will use, and
-// report true so the launcher emits `--resume`.
-func TestSessionHasConversationData_ImportsTranscriptFromOtherConfigDir(t *testing.T) {
+// dir. The resume-time chokepoint (conversationIsResumable) must locate it in
+// ~/.claude (or any profile's config_dir), copy it into the dir the new
+// process will use, and report true so the launcher emits `--resume`.
+func TestConversationIsResumable_ImportsTranscriptFromOtherConfigDir(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	accountDir := filepath.Join(home, ".claude-account2")
@@ -46,7 +46,16 @@ func TestSessionHasConversationData_ImportsTranscriptFromOtherConfigDir(t *testi
 	inst.Tool = "claude"
 	inst.ClaudeSessionID = sessionID
 
-	if !sessionHasConversationData(inst, sessionID) {
+	// The predicate alone is a pure read: the hook/tmux rebind gates call
+	// it on live sessions, so it must not copy anything.
+	if sessionHasConversationData(inst, sessionID) {
+		t.Fatal("predicate must report false without importing")
+	}
+	if _, err := os.Stat(filepath.Join(accountDir, "projects")); !os.IsNotExist(err) {
+		t.Fatal("predicate must not write into the account config dir")
+	}
+
+	if !conversationIsResumable(inst, sessionID) {
 		t.Fatal("expected true: transcript exists in ~/.claude and must be imported, not replaced by --session-id")
 	}
 
@@ -63,8 +72,105 @@ func TestSessionHasConversationData_ImportsTranscriptFromOtherConfigDir(t *testi
 	}
 
 	// Second call: the file is now in place, no import needed, still true.
-	if !sessionHasConversationData(inst, sessionID) {
+	if !conversationIsResumable(inst, sessionID) {
 		t.Error("expected true on the second call with the transcript already imported")
+	}
+}
+
+// The already-poisoned case from the issue: a `--session-id` launch left a
+// system-prompt-only stub at the primary path (larger than the real
+// transcript), while the real conversation sits in ~/.claude. The stub must
+// be replaced (backed up, not lost) by the real transcript.
+func TestConversationIsResumable_ReplacesStubWithRealTranscript(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	accountDir := filepath.Join(home, ".claude-account2")
+	t.Setenv("CLAUDE_CONFIG_DIR", accountDir)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	projectPath := filepath.Join(home, "code", "proj")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	encoded := ConvertToClaudeDirName(projectPath)
+	sessionID := "22222222-2222-3333-4444-555555555555"
+
+	real := `{"type":"user","sessionId":"` + sessionID + `","message":{"role":"user","content":"hi"}}` + "\n"
+	defaultProj := filepath.Join(home, ".claude", "projects", encoded)
+	if err := os.MkdirAll(defaultProj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(defaultProj, sessionID+".jsonl"), []byte(real), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Stub: no "sessionId" anywhere, but much larger than the real file.
+	stub := `{"type":"system","subtype":"init","prompt":"` + strings.Repeat("x", 4096) + `"}` + "\n"
+	accountProj := filepath.Join(accountDir, "projects", encoded)
+	if err := os.MkdirAll(accountProj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(accountProj, sessionID+".jsonl")
+	if err := os.WriteFile(dst, []byte(stub), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	inst := NewInstance("restart-stub", projectPath)
+	inst.Tool = "claude"
+	inst.ClaudeSessionID = sessionID
+
+	if !conversationIsResumable(inst, sessionID) {
+		t.Fatal("expected true: the real transcript must replace the stub")
+	}
+	got, _ := os.ReadFile(dst)
+	if string(got) != real {
+		t.Errorf("primary path should now hold the real transcript, got %q", got)
+	}
+	baks, _ := filepath.Glob(dst + ".bak-*")
+	if len(baks) != 1 {
+		t.Errorf("stub should have been backed up, found %v", baks)
+	}
+}
+
+func TestConversationIsResumable_KeepsPrimaryWhenItHasData(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	accountDir := filepath.Join(home, ".claude-account2")
+	t.Setenv("CLAUDE_CONFIG_DIR", accountDir)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	projectPath := filepath.Join(home, "code", "proj")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	encoded := ConvertToClaudeDirName(projectPath)
+	sessionID := "33333333-2222-3333-4444-555555555555"
+	primary := `{"type":"user","sessionId":"` + sessionID + `","message":{"role":"user","content":"newer and longer conversation"}}` + "\n"
+	older := `{"type":"user","sessionId":"` + sessionID + `"}` + "\n"
+	accountProj := filepath.Join(accountDir, "projects", encoded)
+	defaultProj := filepath.Join(home, ".claude", "projects", encoded)
+	for _, d := range []string{accountProj, defaultProj} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dst := filepath.Join(accountProj, sessionID+".jsonl")
+	_ = os.WriteFile(dst, []byte(primary), 0o600)
+	_ = os.WriteFile(filepath.Join(defaultProj, sessionID+".jsonl"), []byte(older), 0o600)
+
+	inst := NewInstance("restart-keep", projectPath)
+	inst.Tool = "claude"
+	inst.ClaudeSessionID = sessionID
+
+	if !conversationIsResumable(inst, sessionID) {
+		t.Fatal("expected true")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != primary {
+		t.Errorf("primary transcript must be left alone when it is the best copy, got %q", got)
+	}
+	if baks, _ := filepath.Glob(dst + ".bak-*"); len(baks) != 0 {
+		t.Errorf("no backup expected, found %v", baks)
 	}
 }
 
@@ -81,7 +187,7 @@ func TestSessionHasConversationData_NoImportWhenNowhere(t *testing.T) {
 	inst.Tool = "claude"
 	inst.ClaudeSessionID = "aaaaaaaa-0000-0000-0000-000000000000"
 
-	if sessionHasConversationData(inst, inst.ClaudeSessionID) {
+	if conversationIsResumable(inst, inst.ClaudeSessionID) {
 		t.Error("expected false when the transcript exists in no config dir")
 	}
 	if entries, _ := os.ReadDir(filepath.Join(accountDir, "projects")); len(entries) != 0 {
@@ -92,11 +198,25 @@ func TestSessionHasConversationData_NoImportWhenNowhere(t *testing.T) {
 // The scan keys on the instance's bound id; with an id that is not the
 // instance's own, LocateConversationConfigDir must not be consulted (its
 // empty-id fallback picks the newest sibling conversation).
-func TestImportConversationFromOtherConfigDir_RequiresBoundID(t *testing.T) {
-	inst := NewInstance("unbound", t.TempDir())
+func TestImportConversationForResume_RequiresBoundID(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	accountDir := filepath.Join(home, ".claude-account2")
+	t.Setenv("CLAUDE_CONFIG_DIR", accountDir)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	projectPath := filepath.Join(home, "code", "proj")
+	encoded := ConvertToClaudeDirName(projectPath)
+	defaultProj := filepath.Join(home, ".claude", "projects", encoded)
+	_ = os.MkdirAll(defaultProj, 0o755)
+	_ = os.WriteFile(filepath.Join(defaultProj, "sibling.jsonl"), []byte(`{"type":"user","sessionId":"sibling"}`+"\n"), 0o600)
+
+	inst := NewInstance("unbound", projectPath)
 	inst.Tool = "claude"
-	if got := importConversationFromOtherConfigDir(inst, "some-id", t.TempDir()); got != "" {
-		t.Errorf("expected no import for an id the instance is not bound to, got %q", got)
+	importConversationForResume(inst, "some-id")
+	if _, err := os.Stat(filepath.Join(accountDir, "projects")); !os.IsNotExist(err) {
+		t.Error("nothing may be imported for an id the instance is not bound to")
 	}
 }
 
@@ -147,6 +267,20 @@ func TestCopyConversationStripped(t *testing.T) {
 		got, _ := os.ReadFile(dst)
 		if string(got) != content || written != int64(len(content)) {
 			t.Errorf("got %q (%d bytes), want %q", got, written, content)
+		}
+	})
+
+	t.Run("failed copy leaves nothing at dst", func(t *testing.T) {
+		missing := filepath.Join(dir, "missing.jsonl")
+		target := filepath.Join(dir, "never.jsonl")
+		if _, err := copyConversationStripped(missing, target); err == nil {
+			t.Fatal("expected error for missing source")
+		}
+		if _, err := os.Stat(target); !os.IsNotExist(err) {
+			t.Error("a failed copy must not leave a file at dst")
+		}
+		if leftovers, _ := filepath.Glob(filepath.Join(dir, "never.jsonl.tmp-*")); len(leftovers) != 0 {
+			t.Errorf("staging file leaked: %v", leftovers)
 		}
 	})
 

@@ -390,8 +390,11 @@ func isSuppressedConversationRecord(line []byte) bool {
 // copyConversationStripped copies a conversation jsonl from src to dst with
 // the same safety checks as copyFileVerified, dropping the records named in
 // suppressedConversationRecordTypes. Every other byte is copied verbatim; the
-// size check accounts for the dropped lines exactly. Returns the bytes
-// written.
+// size check accounts for the dropped lines exactly. The copy is staged in a
+// sibling temp file and renamed into place only after it verifies, so a
+// failure never leaves a partial or mismatched file at dst - a file there
+// would be resumed by the next restart and shadow the real transcript.
+// Returns the bytes written.
 func copyConversationStripped(src, dst string) (int64, error) {
 	srcInfo, err := os.Lstat(src)
 	if err != nil {
@@ -420,14 +423,41 @@ func copyConversationStripped(src, dst string) (int64, error) {
 	}
 	defer in.Close()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	tmp, err := os.CreateTemp(filepath.Dir(dst), filepath.Base(dst)+".tmp-*")
 	if err != nil {
-		return 0, fmt.Errorf("create target conversation: %w", err)
+		return 0, fmt.Errorf("create staging file: %w", err)
 	}
-	w := bufio.NewWriter(out)
-	r := bufio.NewReaderSize(in, 64*1024)
-	var written, dropped int64
-	var copyErr error
+	tmpPath := tmp.Name()
+	cleanup := func() { _ = os.Remove(tmpPath) }
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		cleanup()
+		return 0, fmt.Errorf("chmod staging file: %w", err)
+	}
+	written, dropped, copyErr := writeConversationStripped(tmp, in)
+	if closeErr := tmp.Close(); copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		cleanup()
+		return 0, fmt.Errorf("copy conversation: %w", copyErr)
+	}
+	if written+dropped != srcInfo.Size() {
+		cleanup()
+		return 0, fmt.Errorf("size mismatch after copy: wrote %d bytes and dropped %d, source has %d", written, dropped, srcInfo.Size())
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		cleanup()
+		return 0, fmt.Errorf("install conversation: %w", err)
+	}
+	return written, nil
+}
+
+// writeConversationStripped streams src into dst line by line, skipping the
+// suppressed record types. Returns bytes written and bytes dropped.
+func writeConversationStripped(dst io.Writer, src io.Reader) (written, dropped int64, err error) {
+	w := bufio.NewWriter(dst)
+	r := bufio.NewReaderSize(src, 64*1024)
 	for {
 		// ReadBytes keeps the trailing newline, so a kept line is written
 		// back byte-for-byte and the last (possibly unterminated) line is
@@ -440,8 +470,7 @@ func copyConversationStripped(src, dst string) (int64, error) {
 				n, werr := w.Write(line)
 				written += int64(n)
 				if werr != nil {
-					copyErr = werr
-					break
+					return written, dropped, werr
 				}
 			}
 		}
@@ -449,23 +478,10 @@ func copyConversationStripped(src, dst string) (int64, error) {
 			break
 		}
 		if readErr != nil {
-			copyErr = readErr
-			break
+			return written, dropped, readErr
 		}
 	}
-	if copyErr == nil {
-		copyErr = w.Flush()
-	}
-	if closeErr := out.Close(); copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		return 0, fmt.Errorf("copy conversation: %w", copyErr)
-	}
-	if written+dropped != srcInfo.Size() {
-		return 0, fmt.Errorf("size mismatch after copy: wrote %d bytes and dropped %d, source has %d", written, dropped, srcInfo.Size())
-	}
-	return written, nil
+	return written, dropped, w.Flush()
 }
 
 // copyFileVerified copies src to dst (0600, matching Claude's conversation
