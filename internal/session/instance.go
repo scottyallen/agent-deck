@@ -7662,21 +7662,23 @@ func conversationIsResumable(inst *Instance, sessionID string) bool {
 // stale history-suppression records and backing up any existing destination
 // - so the launcher emits `--resume` against the full history.
 //
-// Selection: LocateConversationConfigDir picks the largest exact-id match
-// across every known config dir. When that is already the resolved dir but
-// the file there carries no conversation data (a stub can outweigh a short
-// real conversation), the largest exact-id file elsewhere that DOES carry
-// conversation data wins instead. Nothing is written when the resolved dir
-// already holds the best copy, or when no other dir holds one at all.
+// A primary transcript that carries conversation data is authoritative and
+// is never replaced: the import strips records, so a copy in another dir can
+// be LARGER than the primary without being newer, and Claude appends to the
+// primary from the moment it resumes. Only a missing primary or a stub (no
+// "sessionId" line) is filled in, from the largest exact-id file elsewhere
+// that does carry conversation data. Nothing is written otherwise.
 func importConversationForResume(inst *Instance, sessionID string) {
 	if inst == nil || sessionID == "" || !inst.TranscriptIsResolvableLocally() {
 		return
 	}
-	// LocateConversationConfigDir keys on inst.ClaudeSessionID and, with an
-	// empty id, falls back to the newest conversation for the project - which
-	// could be a sibling session's. Only scan for the instance's own bound id.
+	// The scan below keys on the instance's own bound id. With an unbound or
+	// different id there is nothing that can be attributed to this session.
 	if strings.TrimSpace(inst.ClaudeSessionID) != sessionID {
 		return
+	}
+	if sessionHasConversationData(inst, sessionID) {
+		return // primary (or a same-dir cross-project hit) is authoritative
 	}
 	configDir := GetClaudeConfigDirForInstance(inst)
 	if configDir == "" {
@@ -7688,37 +7690,35 @@ func importConversationForResume(inst *Instance, sessionID string) {
 	sameDir := func(a, b string) bool {
 		return filepath.Clean(a) == filepath.Clean(b) || resolveRealPath(a) == resolveRealPath(b)
 	}
-	cfg, _ := LoadUserConfig()
-	srcDir, _, srcSize := LocateConversationConfigDir(cfg, inst, configDir)
-	if srcDir == "" {
-		return // nowhere on this host: nothing to import
+	// The id is session state, not a path: refuse anything that is not a
+	// single path segment before it is joined under a config root.
+	fileName, err := conversationPathComponent(sessionID + ".jsonl")
+	if err != nil {
+		return
 	}
-	if sameDir(srcDir, configDir) {
-		// The largest copy is already where the process will look. Unless it
-		// is a stub, there is nothing to do.
-		if sessionHasConversationData(inst, sessionID) {
-			return
+	cfg, _ := LoadUserConfig()
+	srcDir, srcSize := "", int64(0)
+	for _, dir := range conversationConfigDirCandidates(cfg, configDir) {
+		if sameDir(dir, configDir) {
+			continue
 		}
-		srcDir, srcSize = "", 0
-		for _, dir := range conversationConfigDirCandidates(cfg, configDir) {
-			if sameDir(dir, configDir) {
+		for _, projDirName := range conversationProjectDirNames(inst.ProjectPath) {
+			path, err := containedConversationPath(dir, "projects", projDirName, fileName)
+			if err != nil {
 				continue
 			}
-			for _, projDirName := range conversationProjectDirNames(inst.ProjectPath) {
-				path := filepath.Join(dir, "projects", projDirName, sessionID+".jsonl")
-				info, err := os.Stat(path)
-				if err != nil || !info.Mode().IsRegular() || info.Size() <= srcSize {
-					continue
-				}
-				if !transcriptFileHasConversationData(path) {
-					continue
-				}
-				srcDir, srcSize = dir, info.Size()
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Size() <= srcSize {
+				continue
 			}
+			if !transcriptFileHasConversationData(path) {
+				continue
+			}
+			srcDir, srcSize = dir, info.Size()
 		}
-		if srcDir == "" {
-			return
-		}
+	}
+	if srcDir == "" {
+		return // nowhere else on this host: nothing to import
 	}
 	dst, written, err := MigrateConversationFromSized(inst, srcDir, configDir)
 	if err != nil || dst == "" {

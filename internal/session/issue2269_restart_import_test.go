@@ -132,6 +132,55 @@ func TestConversationIsResumable_ReplacesStubWithRealTranscript(t *testing.T) {
 	}
 }
 
+// The stripped import is always smaller than its source, and Claude appends
+// to the primary once it resumes; a larger copy elsewhere is therefore not
+// evidence of more history. A primary with conversation data is never
+// replaced, even by a larger file.
+func TestConversationIsResumable_LargerSourceDoesNotReplacePrimaryWithData(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	accountDir := filepath.Join(home, ".claude-account2")
+	t.Setenv("CLAUDE_CONFIG_DIR", accountDir)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	projectPath := filepath.Join(home, "code", "proj")
+	if err := os.MkdirAll(projectPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	encoded := ConvertToClaudeDirName(projectPath)
+	sessionID := "44444444-2222-3333-4444-555555555555"
+	base := `{"type":"user","sessionId":"` + sessionID + `","message":{"role":"user","content":"hi"}}` + "\n"
+	newTurn := `{"type":"assistant","sessionId":"` + sessionID + `","message":{"role":"assistant","content":"new turn"}}` + "\n"
+	source := base +
+		`{"type":"history-suppression","cause":"restored_owner_mismatch","sessionId":"` + sessionID + `","padding":"` + strings.Repeat("x", 512) + `"}` + "\n" +
+		`{"type":"bridge-session","sessionId":"` + sessionID + `"}` + "\n"
+	accountProj := filepath.Join(accountDir, "projects", encoded)
+	defaultProj := filepath.Join(home, ".claude", "projects", encoded)
+	for _, d := range []string{accountProj, defaultProj} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dst := filepath.Join(accountProj, sessionID+".jsonl")
+	_ = os.WriteFile(dst, []byte(base+newTurn), 0o600)
+	_ = os.WriteFile(filepath.Join(defaultProj, sessionID+".jsonl"), []byte(source), 0o600)
+
+	inst := NewInstance("restart-newer-primary", projectPath)
+	inst.Tool = "claude"
+	inst.ClaudeSessionID = sessionID
+
+	if !conversationIsResumable(inst, sessionID) {
+		t.Fatal("expected true")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != base+newTurn {
+		t.Errorf("primary with data must be authoritative, got %q", got)
+	}
+	if baks, _ := filepath.Glob(dst + ".bak-*"); len(baks) != 0 {
+		t.Errorf("no backup expected, found %v", baks)
+	}
+}
+
 func TestConversationIsResumable_KeepsPrimaryWhenItHasData(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
