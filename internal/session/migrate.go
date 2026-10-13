@@ -597,7 +597,15 @@ func containedConversationPath(root string, components ...string) (string, error
 // substitutes one transcript for another while every directory on the path
 // looks ordinary.
 func ensureContainedSourcePath(root, path string) error {
-	resolvedRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	root = filepath.Clean(root)
+	// Containment is measured against the RESOLVED root, so a symlink at the
+	// root itself would be resolved away and every path under it would read as
+	// contained - the one shape this guard exists to refuse. Refuse the root
+	// being a link outright; a real projects dir is never one.
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("projects root is a symlink: %s", root)
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		// No projects dir yet is not a containment failure; the caller reports
 		// the missing artifact.
