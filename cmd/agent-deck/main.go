@@ -5224,3 +5224,5 @@ func formatSize(bytes int64) string {
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
+
+// CI baseline probe, 2026-10-13: comment-only, throwaway branch, do not merge.
