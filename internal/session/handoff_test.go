@@ -197,6 +197,104 @@ func TestBuildClaudeToCodexHandoffPrompt_RejectsSymlinkedExactSource(t *testing.
 	}
 }
 
+// A project whose path changed keeps one transcript store reachable under both
+// its old and new encoded names, by making the new name a symlink to the old
+// entry in the same projects dir. That is contained, so it must be followed -
+// refusing it made every session in such a project permanently unmovable.
+func TestBuildClaudeToCodexHandoffPrompt_FollowsSymlinkedProjectDirInsideProjects(t *testing.T) {
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	project := t.TempDir()
+	const sessionID = "17171717-2222-3333-4444-555555555555"
+
+	projects := filepath.Join(claudeDir, "projects")
+	store := filepath.Join(projects, "-some-older-encoded-name")
+	if err := os.MkdirAll(store, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := `{"sessionId":"` + sessionID + `","type":"user","message":{"role":"user","content":"hello from the shared store"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(store, sessionID+".jsonl"), []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The encoded name this session resolves to is the symlink, not the store.
+	link := filepath.Join(projects, ConvertToClaudeDirName(project))
+	if err := os.Symlink(store, link); err != nil {
+		t.Fatal(err)
+	}
+
+	prompt, _, err := BuildClaudeToCodexHandoffPrompt(&Instance{Title: "symlinked project dir", ProjectPath: project, Tool: "claude", ClaudeSessionID: sessionID}, DefaultHandoffMaxChars)
+	if err != nil {
+		t.Fatalf("symlinked project dir inside projects: err = %v, want success", err)
+	}
+	if !strings.Contains(prompt, "hello from the shared store") {
+		t.Fatalf("prompt did not carry the transcript read through the symlink: %q", prompt)
+	}
+}
+
+// The containment branch itself: a project-dir symlink that leaves the account's
+// own projects tree points at another account's transcript, and is refused even
+// though the transcript it lands on is a perfectly real file. Without this the
+// filepath.Rel logic could be deleted and the suite would not notice.
+func TestBuildClaudeToCodexHandoffPrompt_RejectsSymlinkedProjectDirOutsideProjects(t *testing.T) {
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	project := t.TempDir()
+	const sessionID = "18181818-2222-3333-4444-555555555555"
+
+	// Another account's store, outside this account's projects tree entirely.
+	foreign := filepath.Join(t.TempDir(), "other-account-projects", "-encoded")
+	if err := os.MkdirAll(foreign, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := `{"sessionId":"` + sessionID + `","type":"user","message":{"role":"user","content":"someone else's conversation"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(foreign, sessionID+".jsonl"), []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	projects := filepath.Join(claudeDir, "projects")
+	if err := os.MkdirAll(projects, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreign, filepath.Join(projects, ConvertToClaudeDirName(project))); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := BuildClaudeToCodexHandoffPrompt(&Instance{Title: "escaping symlink", ProjectPath: project, Tool: "claude", ClaudeSessionID: sessionID}, DefaultHandoffMaxChars)
+	if err == nil || !strings.Contains(err.Error(), "resolves outside") {
+		t.Fatalf("escaping project-dir symlink error = %v, want a containment refusal", err)
+	}
+}
+
+// A symlink at `projects` ITSELF is the shape that defeats a containment check
+// measured against the resolved root: resolve it and everything beneath reads
+// as contained. Verified against account B's store, where the same session id
+// also exists.
+func TestBuildClaudeToCodexHandoffPrompt_RejectsSymlinkedProjectsRoot(t *testing.T) {
+	claudeDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)
+	project := t.TempDir()
+	const sessionID = "19191919-2222-3333-4444-555555555555"
+
+	// Account B holds a transcript under the SAME encoded name.
+	accountB := t.TempDir()
+	storeB := filepath.Join(accountB, "projects", ConvertToClaudeDirName(project))
+	if err := os.MkdirAll(storeB, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := `{"sessionId":"` + sessionID + `","type":"user","message":{"role":"user","content":"account B's conversation"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(storeB, sessionID+".jsonl"), []byte(record), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Account A's whole projects dir is a link to account B's.
+	if err := os.Symlink(filepath.Join(accountB, "projects"), filepath.Join(claudeDir, "projects")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := BuildClaudeToCodexHandoffPrompt(&Instance{Title: "symlinked projects root", ProjectPath: project, Tool: "claude", ClaudeSessionID: sessionID}, DefaultHandoffMaxChars)
+	if err == nil || !strings.Contains(err.Error(), "projects root is a symlink") {
+		t.Fatalf("symlinked projects root error = %v, want a refusal", err)
+	}
+}
+
 func TestBuildClaudeToCodexHandoffPrompt_RejectsMalformedNonTailRecord(t *testing.T) {
 	claudeDir := t.TempDir()
 	t.Setenv("CLAUDE_CONFIG_DIR", claudeDir)

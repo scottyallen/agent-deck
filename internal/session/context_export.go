@@ -238,9 +238,9 @@ func exportPiContext(inst *Instance, sessionID string, maxBytes int, portable bo
 // Claude keys its project directory from the actual launch cwd. For multi-repo
 // sessions that is EffectiveWorkingDir, not the display ProjectPath. Do not
 // fall back to ProjectPath when they differ: that would turn a neighbouring
-// project's exact-ID artifact into source evidence. All existing path
-// components are also required to be real directories/files; a symlinked
-// account/project/artifact path is refused rather than followed.
+// project's exact-ID artifact into source evidence. The path may be reached
+// through a symlink, but only one that still resolves inside this account's
+// own projects tree; see ensureContainedSourcePath.
 func canonicalClaudeExactTranscriptPath(inst *Instance) (string, error) {
 	if inst == nil {
 		return "", fmt.Errorf("Claude source instance is nil")
@@ -260,8 +260,9 @@ func canonicalClaudeExactTranscriptPath(inst *Instance) (string, error) {
 	if encoded == "" {
 		encoded = "-"
 	}
-	path := filepath.Join(dir, "projects", encoded, inst.ClaudeSessionID+".jsonl")
-	if err := ensureNoSymlinkPath(path); err != nil {
+	projects := filepath.Join(dir, "projects")
+	path := filepath.Join(projects, encoded, inst.ClaudeSessionID+".jsonl")
+	if err := ensureContainedSourcePath(projects, path); err != nil {
 		return "", fmt.Errorf("unsafe exact Claude source path: %w", err)
 	}
 	return path, nil

@@ -138,8 +138,13 @@ func claudeProjectKeyCandidatesWith(workingDir, goos string, resolve func(string
 }
 
 // claudeTranscriptCopies finds every regular-file copy of sessionID's
-// transcript under configDir for the given keys and measures each one. A
-// symlink anywhere on a candidate path is an error, never followed.
+// transcript under configDir for the given keys and measures each one.
+//
+// This only ever reads, so a candidate path may be reached through a symlink
+// as long as it still resolves inside configDir's own projects tree. The
+// transcript itself must still be a regular file - a symlink in the final
+// component is refused below, which is what keeps a link pointing at another
+// account's transcript out.
 func claudeTranscriptCopies(configDir string, keys []string, sessionID, side string) ([]TranscriptCandidate, error) {
 	configDir = ExpandPath(strings.TrimSpace(configDir))
 	if configDir == "" || sessionID == "" {
@@ -152,7 +157,7 @@ func claudeTranscriptCopies(configDir string, keys []string, sessionID, side str
 			continue
 		}
 		path := filepath.Join(dir, sessionID+".jsonl")
-		if err := ensureNoSymlinkPath(path); err != nil {
+		if err := ensureContainedSourcePath(filepath.Join(configDir, "projects"), path); err != nil {
 			return nil, fmt.Errorf("unsafe exact Claude %s path: %w", side, err)
 		}
 		info, err := os.Lstat(path)
