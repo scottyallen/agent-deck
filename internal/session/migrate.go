@@ -571,6 +571,94 @@ func containedConversationPath(root string, components ...string) (string, error
 	return joined, nil
 }
 
+// ensureContainedSourcePath verifies that path, once symlinks are resolved,
+// still names a location inside root. It is the READ-side counterpart to
+// ensureNoSymlinkPath below.
+//
+// The two differ because the hazards differ. At a write site, following a
+// symlink in an intermediate directory lets MkdirAll and OpenFile escape the
+// destination and write through to the source, so no symlink is tolerable
+// there at all. A source transcript is only ever opened for reading, where a
+// symlinked component is not that hazard - it is just a different location on
+// disk.
+//
+// Applying the write-site guard to the source made whole projects permanently
+// unmovable. A Claude config dir legitimately holds a projects/<encoded> entry
+// that is a symlink to another entry in the same projects dir: that is how a
+// project whose path changed keeps ONE transcript store reachable under both
+// its old and new encoded names. Every switch for such a session failed with
+// "path component is a symlink", and no amount of retrying could help, because
+// nothing about the session was wrong.
+//
+// Two things still have to hold. Containment: the resolved path must not leave
+// root, so a link into another account's projects tree is refused. And the
+// artifact itself must be a real file - a symlink in the FINAL component is
+// refused whether it is contained or not, because that is the shape that
+// substitutes one transcript for another while every directory on the path
+// looks ordinary.
+func ensureContainedSourcePath(root, path string) error {
+	resolvedRoot, err := filepath.EvalSymlinks(filepath.Clean(root))
+	if err != nil {
+		// No projects dir yet is not a containment failure; the caller reports
+		// the missing artifact.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	resolved, err := resolveDeepestExisting(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("path resolves outside %s: %s -> %s", resolvedRoot, path, resolved)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		// Absent is the caller's to report; Lstat does not follow the final
+		// component, so every other error is a real inspection failure.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("artifact itself is a symlink: %s", path)
+	}
+	return nil
+}
+
+// resolveDeepestExisting resolves the symlinks in the longest existing prefix
+// of path and rejoins the components that do not exist yet. A transcript that
+// is simply absent therefore still reports its containment honestly, instead
+// of failing resolution outright.
+func resolveDeepestExisting(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	remainder := []string{}
+	current := abs
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			return filepath.Join(append([]string{resolved}, remainder...)...), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			// Reached the root without finding anything that exists; nothing
+			// was resolved, so the literal path is the honest answer.
+			return abs, nil
+		}
+		remainder = append([]string{filepath.Base(current)}, remainder...)
+		current = parent
+	}
+}
+
 // ensureNoSymlinkPath verifies every existing component of path. MkdirAll and
 // OpenFile otherwise follow a writable symlink in an intermediate destination
 // directory, defeating copy-only source preservation.
