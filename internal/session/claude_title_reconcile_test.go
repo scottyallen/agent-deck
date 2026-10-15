@@ -298,8 +298,8 @@ func seedClaudeSessionWithCwd(t *testing.T, home, sessionID, name, cwd string) {
 // TestResolveTitleFromClaude_ForeignCwdRejected covers the whole cwd-ownership
 // matrix for the title-sync guard. The foreign case is the regression from
 // 2026-10-14, where a row working in personalassistant-claude was renamed to
-// "crosscut-session-error" — the auto-generated name of an unrelated session
-// whose cwd was ~/code/crosscut — because a foreign session id stayed bound and
+// "crosscut-session-error", the auto-generated name of an unrelated session
+// whose cwd was ~/code/crosscut, because a foreign session id stayed bound and
 // every later hook event re-read that foreign record's name.
 func TestResolveTitleFromClaude_ForeignCwdRejected(t *testing.T) {
 	cases := []struct {

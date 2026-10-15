@@ -277,7 +277,7 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	// The name is only this session's name if the process that wrote it was
 	// working inside this session's own tree. A session id can get bound to an
 	// instance from a foreign ephemeral Claude process, and once bound it
-	// stays bound — so every later hook event re-reads that foreign record and
+	// stays bound, so every later hook event re-reads that foreign record and
 	// stamps its name over the row, silently and repeatedly.
 	//
 	// Observed 2026-10-14: a deck row auditing invoices under
@@ -286,7 +286,7 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	// ~/code/crosscut. The row became unfindable by name. The deck's own
 	// candidate-id guard (hookCwdIsForeign, issue #1729) was meanwhile
 	// rejecting ids for that very instance with
-	// candidate_cwd_outside_instance_paths — the id path was protected and the
+	// candidate_cwd_outside_instance_paths - the id path was protected and the
 	// name read through an already-bound id was not.
 	//
 	// Reuses hookCwdIsForeign so "owned" means exactly what it means for the
@@ -295,19 +295,20 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	// is deliberately NOT evidence (hookCwdIsForeign returns false for it), so
 	// older Claude builds that write no cwd keep syncing exactly as before.
 	//
-	// Sandboxed sessions are not affected: their container ~/.claude is a copy
-	// rooted at the host's ~/.claude/sandbox (internal/docker.SandboxDir), so
-	// their session records never appear in the ~/.claude/sessions this reads
-	// and title sync does not reach them either way.
-	// ...but only when the instance actually declares a path to be outside of.
-	// hookCwdIsForeign calls every cwd foreign when all the owned paths are
-	// empty, which is the conservative answer for a bind decision (#1729) and
+	// The guard applies only when the instance actually declares a path to be
+	// outside of. hookCwdIsForeign calls every cwd foreign when all the owned
+	// paths are empty, which is the conservative answer for a bind decision (#1729) and
 	// the wrong one here: it would silently disable title sync for the whole
 	// life of a session with no ProjectPath, a state several call sites
 	// explicitly handle (internal/ui/home.go, internal/session/groups.go).
 	// No declared path is no evidence, exactly like an empty cwd. Checked here
 	// rather than inside hookCwdIsForeign so the bind path's behaviour is
 	// untouched.
+	//
+	// Sandboxed sessions are not affected either way: their container
+	// ~/.claude is a copy rooted at the host's ~/.claude/sandbox
+	// (internal/docker.SandboxDir), so their session records never appear in
+	// the ~/.claude/sessions this reads and title sync does not reach them.
 	if i.declaresOwnedPath() && i.hookCwdIsForeign(cwd) {
 		return "", false
 	}
