@@ -21,6 +21,12 @@ type claudeSessionMeta struct {
 	// ("derived"). Only user renames are real intent; see ClaudeSessionNameIn.
 	NameSource string `json:"nameSource"`
 	UpdatedAt  *int64 `json:"updatedAt"` // unix ms; nil when absent
+	// Cwd is the working directory of the Claude process that wrote this
+	// record. Read by the title-sync path to reject a name written by a
+	// process working outside the instance's own tree; see
+	// Instance.ResolveTitleFromClaude. Absent on older Claude builds, which
+	// is treated as no evidence rather than as foreign.
+	Cwd string `json:"cwd"`
 
 	// The fields below are read for ClaudeSessionRecordIn (#2089) and are not
 	// used by the title-sync path.
@@ -99,26 +105,46 @@ func freshestClaudeSessionMetaIn(claudeDir, sessionID string) (claudeSessionMeta
 // stale user name (mirrors the freshest-unnamed rule). A name with no
 // nameSource (older Claude) is always a user rename, so it is honored.
 func ClaudeSessionNameIn(claudeDir, sessionID string) string {
+	name, _ := claudeSessionNameAndCwdIn(claudeDir, sessionID)
+	return name
+}
+
+// claudeSessionNameAndCwdIn is ClaudeSessionNameIn plus the cwd of the process
+// that wrote the name, read from the SAME winning record. The pairing is the
+// whole point: a resumed session matches several per-PID files, so taking the
+// name from the freshest entry and the cwd from whichever file happened to
+// answer a second scan could clear a foreign name's cwd with an owned one and
+// defeat the check in ResolveTitleFromClaude. cwd is "" when the record omits
+// it (older Claude).
+func claudeSessionNameAndCwdIn(claudeDir, sessionID string) (string, string) {
 	meta, ok := freshestClaudeSessionMetaIn(claudeDir, sessionID)
 	if !ok {
-		return ""
+		return "", ""
 	}
 	// A folder-derived name is not user intent: treat it as unnamed so it
 	// neither syncs nor lets a stale named entry win.
 	if meta.NameSource == "derived" {
-		return ""
+		return "", ""
 	}
-	return strings.TrimSpace(meta.Name)
+	return strings.TrimSpace(meta.Name), strings.TrimSpace(meta.Cwd)
 }
 
 // ClaudeSessionName resolves the user's ~/.claude and returns the Claude
 // session name for sessionID. Empty string on any error or no match.
 func ClaudeSessionName(sessionID string) string {
+	name, _ := claudeSessionNameAndCwd(sessionID)
+	return name
+}
+
+// claudeSessionNameAndCwd is ClaudeSessionName plus the writing process's cwd,
+// from the same record. Sibling of claudeSessionNameAndCwdIn for callers that
+// resolve the user's ~/.claude themselves.
+func claudeSessionNameAndCwd(sessionID string) (string, string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	return ClaudeSessionNameIn(filepath.Join(home, ".claude"), sessionID)
+	return claudeSessionNameAndCwdIn(filepath.Join(home, ".claude"), sessionID)
 }
 
 // ClaudeSessionRecord is the subset of ~/.claude/sessions/<pid>.json
@@ -244,11 +270,63 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	if cfg, err := LoadUserConfig(); err == nil && cfg != nil && !cfg.GetSyncTitle() {
 		return "", false
 	}
-	name := ClaudeSessionName(sessionID)
+	name, cwd := claudeSessionNameAndCwd(sessionID)
 	if name == "" || name == i.Title {
 		return "", false
 	}
+	// The name is only this session's name if the process that wrote it was
+	// working inside this session's own tree. A session id can get bound to an
+	// instance from a foreign ephemeral Claude process, and once bound it
+	// stays bound, so every later hook event re-reads that foreign record and
+	// stamps its name over the row, silently and repeatedly.
+	//
+	// Observed 2026-10-14: a deck row auditing invoices under
+	// personalassistant-claude was renamed to "crosscut-session-error", the
+	// auto-generated name of an unrelated Claude session whose cwd was
+	// ~/code/crosscut. The row became unfindable by name. The deck's own
+	// candidate-id guard (hookCwdIsForeign, issue #1729) was meanwhile
+	// rejecting ids for that very instance with
+	// candidate_cwd_outside_instance_paths - the id path was protected and the
+	// name read through an already-bound id was not.
+	//
+	// Reuses hookCwdIsForeign so "owned" means exactly what it means for the
+	// bind decision: EffectiveWorkingDir, ProjectPath or any additional path,
+	// subdirectories included, symlinks resolved on both sides. An empty cwd
+	// is deliberately NOT evidence (hookCwdIsForeign returns false for it), so
+	// older Claude builds that write no cwd keep syncing exactly as before.
+	//
+	// The guard applies only when the instance actually declares a path to be
+	// outside of. hookCwdIsForeign calls every cwd foreign when all the owned
+	// paths are empty, which is the conservative answer for a bind decision (#1729) and
+	// the wrong one here: it would silently disable title sync for the whole
+	// life of a session with no ProjectPath, a state several call sites
+	// explicitly handle (internal/ui/home.go, internal/session/groups.go).
+	// No declared path is no evidence, exactly like an empty cwd. Checked here
+	// rather than inside hookCwdIsForeign so the bind path's behaviour is
+	// untouched.
+	//
+	// Sandboxed sessions are not affected either way: their container
+	// ~/.claude is a copy rooted at the host's ~/.claude/sandbox
+	// (internal/docker.SandboxDir), so their session records never appear in
+	// the ~/.claude/sessions this reads and title sync does not reach them.
+	if i.declaresOwnedPath() && i.hookCwdIsForeign(cwd) {
+		return "", false
+	}
 	return name, true
+}
+
+// declaresOwnedPath reports whether the instance names at least one path it
+// owns, so a cwd can meaningfully be judged inside or outside it.
+func (i *Instance) declaresOwnedPath() bool {
+	if strings.TrimSpace(i.EffectiveWorkingDir()) != "" {
+		return true
+	}
+	for _, p := range i.AllProjectPaths() {
+		if strings.TrimSpace(p) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ReconcileTitleFromClaude refreshes i.Title from the agent's current Claude

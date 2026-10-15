@@ -282,3 +282,233 @@ func TestReconcileTitleFromClaude_NoopWhenDerived(t *testing.T) {
 		t.Errorf("Title = %q, want unchanged dev", inst.Title)
 	}
 }
+
+// seedClaudeSessionWithCwd writes a session record carrying the `cwd` of the
+// process that wrote the name, which is what the foreign-name guard in
+// ResolveTitleFromClaude reads.
+func seedClaudeSessionWithCwd(t *testing.T, home, sessionID, name, cwd string) {
+	t.Helper()
+	seedClaudeSessionFile(t, home, "1234.json", map[string]any{
+		"sessionId": sessionID,
+		"name":      name,
+		"cwd":       cwd,
+	})
+}
+
+// TestResolveTitleFromClaude_ForeignCwdRejected covers the whole cwd-ownership
+// matrix for the title-sync guard. The foreign case is the regression from
+// 2026-10-14, where a row working in personalassistant-claude was renamed to
+// "crosscut-session-error", the auto-generated name of an unrelated session
+// whose cwd was ~/code/crosscut, because a foreign session id stayed bound and
+// every later hook event re-read that foreign record's name.
+func TestResolveTitleFromClaude_ForeignCwdRejected(t *testing.T) {
+	cases := []struct {
+		name string
+		// cwd layout relative to a shared temp root; "" means the record
+		// carries no cwd at all (older Claude).
+		cwdSub   string
+		omitCwd  bool
+		viaLink  bool
+		wantSync bool
+	}{
+		{
+			name:     "record cwd is the project path itself",
+			cwdSub:   "project",
+			wantSync: true,
+		},
+		{
+			name:     "record cwd is a subdirectory of the project",
+			cwdSub:   "project/internal/deep",
+			wantSync: true,
+		},
+		{
+			name:     "record cwd reached through a symlink still counts as owned",
+			cwdSub:   "project",
+			viaLink:  true,
+			wantSync: true,
+		},
+		{
+			// The crosscut-session-error case: a sibling tree the instance
+			// does not own.
+			name:     "crosscut_session_error foreign sibling cwd is rejected",
+			cwdSub:   "crosscut",
+			wantSync: false,
+		},
+		{
+			name:     "absent cwd is not evidence and still syncs",
+			omitCwd:  true,
+			wantSync: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			root := t.TempDir()
+
+			project := filepath.Join(root, "project")
+			if err := os.MkdirAll(filepath.Join(project, "internal", "deep"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(root, "crosscut"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			cwd := ""
+			if !tc.omitCwd {
+				cwd = filepath.Join(root, tc.cwdSub)
+				if tc.viaLink {
+					link := filepath.Join(root, "project-link")
+					if err := os.Symlink(project, link); err != nil {
+						t.Fatal(err)
+					}
+					cwd = link
+				}
+			}
+
+			seedClaudeSessionWithCwd(t, home, "sid-cwd", "foreign-name", cwd)
+			inst := &Instance{ID: "i-cwd", Title: "invoice-audit", Tool: "claude", ProjectPath: project}
+
+			name, changed := inst.ResolveTitleFromClaude("sid-cwd")
+			if tc.wantSync {
+				if !changed || name != "foreign-name" {
+					t.Fatalf("ResolveTitleFromClaude = (%q,%v), want (%q,true)", name, changed, "foreign-name")
+				}
+				return
+			}
+			if changed || name != "" {
+				t.Fatalf("ResolveTitleFromClaude = (%q,%v), want no-op for a foreign cwd", name, changed)
+			}
+		})
+	}
+}
+
+// TestResolveTitleFromClaude_AdditionalPathCwdOwned: a multi-repo session owns
+// its AdditionalPaths too, so a name written from one of them must still sync.
+func TestResolveTitleFromClaude_AdditionalPathCwdOwned(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := t.TempDir()
+	primary := filepath.Join(root, "primary")
+	extra := filepath.Join(root, "extra")
+	for _, d := range []string{primary, extra} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seedClaudeSessionWithCwd(t, home, "sid-extra", "multi-repo-name", extra)
+	inst := &Instance{
+		ID:              "i-extra",
+		Title:           "before",
+		Tool:            "claude",
+		ProjectPath:     primary,
+		AdditionalPaths: []string{extra},
+	}
+
+	name, changed := inst.ResolveTitleFromClaude("sid-extra")
+	if !changed || name != "multi-repo-name" {
+		t.Fatalf("ResolveTitleFromClaude = (%q,%v), want (%q,true)", name, changed, "multi-repo-name")
+	}
+}
+
+// TestResolveTitleFromClaude_LockedBeatsForeignCwdGuard: TitleLocked and
+// sync_title=false short-circuit BEFORE the cwd guard, so an owned cwd cannot
+// talk either of them into a rename. Checked explicitly because the guard was
+// added after them and sits further down the same function.
+func TestResolveTitleFromClaude_LockedBeatsForeignCwdGuard(t *testing.T) {
+	t.Run("TitleLocked", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		project := t.TempDir()
+
+		seedClaudeSessionWithCwd(t, home, "sid-lock", "auto-name", project)
+		inst := &Instance{ID: "i-lock", Title: "SCRUM-351", TitleLocked: true, Tool: "claude", ProjectPath: project}
+
+		if name, changed := inst.ResolveTitleFromClaude("sid-lock"); changed || name != "" {
+			t.Fatalf("ResolveTitleFromClaude = (%q,%v), want no-op for a locked title", name, changed)
+		}
+	})
+
+	t.Run("sync_title=false", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		project := t.TempDir()
+
+		cfgDir := filepath.Join(home, ".agent-deck")
+		if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cfgDir, "config.toml"), []byte("sync_title = false\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		seedClaudeSessionWithCwd(t, home, "sid-off", "should-not-apply", project)
+		inst := &Instance{ID: "i-off", Title: "loupe", Tool: "claude", ProjectPath: project}
+
+		if name, changed := inst.ResolveTitleFromClaude("sid-off"); changed || name != "" {
+			t.Fatalf("ResolveTitleFromClaude = (%q,%v), want no-op for sync_title=false", name, changed)
+		}
+	})
+}
+
+// TestClaudeSessionNameIn_UnchangedBehaviorAfterCwdRefactor pins the exported
+// reader's contract after it was refactored to delegate to
+// claudeSessionNameAndCwdIn: a record's cwd must not influence the name it
+// returns (cmd/agent-deck/hook_name_sync.go wraps it as a cheap pre-check and
+// has no instance in hand to judge ownership with).
+func TestClaudeSessionNameIn_UnchangedBehaviorAfterCwdRefactor(t *testing.T) {
+	home := t.TempDir()
+	seedClaudeSessionFile(t, home, "1234.json", map[string]any{
+		"sessionId": "sid-raw",
+		"name":      "raw-name",
+		"cwd":       "/somewhere/entirely/else",
+	})
+	if got := ClaudeSessionNameIn(filepath.Join(home, ".claude"), "sid-raw"); got != "raw-name" {
+		t.Errorf("ClaudeSessionNameIn = %q, want %q regardless of cwd", got, "raw-name")
+	}
+}
+
+// TestClaudeSessionNameAndCwdIn_PairsFromOneRecord: the name and the cwd must
+// come from the SAME winning per-PID file. A resumed session leaves a stale
+// file behind; pairing the freshest name with the other file's cwd would let an
+// owned cwd vouch for a foreign name.
+func TestClaudeSessionNameAndCwdIn_PairsFromOneRecord(t *testing.T) {
+	home := t.TempDir()
+	seedClaudeSessionFile(t, home, "100.json", map[string]any{
+		"sessionId": "sid-pair",
+		"name":      "stale-name",
+		"cwd":       "/owned/project",
+		"updatedAt": int64(1000),
+	})
+	seedClaudeSessionFile(t, home, "200.json", map[string]any{
+		"sessionId": "sid-pair",
+		"name":      "fresh-name",
+		"cwd":       "/foreign/tree",
+		"updatedAt": int64(2000),
+	})
+
+	name, cwd := claudeSessionNameAndCwdIn(filepath.Join(home, ".claude"), "sid-pair")
+	if name != "fresh-name" || cwd != "/foreign/tree" {
+		t.Errorf("claudeSessionNameAndCwdIn = (%q,%q), want (%q,%q)", name, cwd, "fresh-name", "/foreign/tree")
+	}
+}
+
+// TestResolveTitleFromClaude_NoDeclaredPathStillSyncs: an instance with no
+// ProjectPath declares no path a cwd could be outside of, so the foreign-cwd
+// guard must not fire. hookCwdIsForeign calls every non-empty cwd foreign in
+// that state, which is the right answer for a bind decision (#1729) and would
+// otherwise silently disable title sync for the session's whole life.
+func TestResolveTitleFromClaude_NoDeclaredPathStillSyncs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	seedClaudeSessionWithCwd(t, home, "sid-nopath", "pathless-name", filepath.Join(t.TempDir(), "anywhere"))
+	inst := &Instance{ID: "i-nopath", Title: "before", Tool: "claude"}
+
+	name, changed := inst.ResolveTitleFromClaude("sid-nopath")
+	if !changed || name != "pathless-name" {
+		t.Fatalf("ResolveTitleFromClaude = (%q,%v), want (%q,true)", name, changed, "pathless-name")
+	}
+}
