@@ -494,3 +494,21 @@ func TestClaudeSessionNameAndCwdIn_PairsFromOneRecord(t *testing.T) {
 		t.Errorf("claudeSessionNameAndCwdIn = (%q,%q), want (%q,%q)", name, cwd, "fresh-name", "/foreign/tree")
 	}
 }
+
+// TestResolveTitleFromClaude_NoDeclaredPathStillSyncs: an instance with no
+// ProjectPath declares no path a cwd could be outside of, so the foreign-cwd
+// guard must not fire. hookCwdIsForeign calls every non-empty cwd foreign in
+// that state, which is the right answer for a bind decision (#1729) and would
+// otherwise silently disable title sync for the session's whole life.
+func TestResolveTitleFromClaude_NoDeclaredPathStillSyncs(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	seedClaudeSessionWithCwd(t, home, "sid-nopath", "pathless-name", filepath.Join(t.TempDir(), "anywhere"))
+	inst := &Instance{ID: "i-nopath", Title: "before", Tool: "claude"}
+
+	name, changed := inst.ResolveTitleFromClaude("sid-nopath")
+	if !changed || name != "pathless-name" {
+		t.Fatalf("ResolveTitleFromClaude = (%q,%v), want (%q,true)", name, changed, "pathless-name")
+	}
+}

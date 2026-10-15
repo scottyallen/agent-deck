@@ -294,10 +294,38 @@ func (i *Instance) ResolveTitleFromClaude(sessionID string) (string, bool) {
 	// subdirectories included, symlinks resolved on both sides. An empty cwd
 	// is deliberately NOT evidence (hookCwdIsForeign returns false for it), so
 	// older Claude builds that write no cwd keep syncing exactly as before.
-	if i.hookCwdIsForeign(cwd) {
+	//
+	// Sandboxed sessions are not affected: their container ~/.claude is a copy
+	// rooted at the host's ~/.claude/sandbox (internal/docker.SandboxDir), so
+	// their session records never appear in the ~/.claude/sessions this reads
+	// and title sync does not reach them either way.
+	// ...but only when the instance actually declares a path to be outside of.
+	// hookCwdIsForeign calls every cwd foreign when all the owned paths are
+	// empty, which is the conservative answer for a bind decision (#1729) and
+	// the wrong one here: it would silently disable title sync for the whole
+	// life of a session with no ProjectPath, a state several call sites
+	// explicitly handle (internal/ui/home.go, internal/session/groups.go).
+	// No declared path is no evidence, exactly like an empty cwd. Checked here
+	// rather than inside hookCwdIsForeign so the bind path's behaviour is
+	// untouched.
+	if i.declaresOwnedPath() && i.hookCwdIsForeign(cwd) {
 		return "", false
 	}
 	return name, true
+}
+
+// declaresOwnedPath reports whether the instance names at least one path it
+// owns, so a cwd can meaningfully be judged inside or outside it.
+func (i *Instance) declaresOwnedPath() bool {
+	if strings.TrimSpace(i.EffectiveWorkingDir()) != "" {
+		return true
+	}
+	for _, p := range i.AllProjectPaths() {
+		if strings.TrimSpace(p) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ReconcileTitleFromClaude refreshes i.Title from the agent's current Claude
